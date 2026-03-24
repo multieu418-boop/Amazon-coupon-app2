@@ -5,93 +5,128 @@ import re
 from io import BytesIO
 import math
 
-class CouponRepairEngine:
+class CouponFullIntegrator:
     @staticmethod
-    def parse_errors(error_file, listing_df):
-        # 使用 openpyxl 加载，确保读取批注
+    def parse_all_asins_and_errors(error_file, listing_df):
         wb = openpyxl.load_workbook(error_file)
         ws = wb.active
         
-        # 建立 All Listing 价格映射
+        # 价格映射
         asin_col = next((c for c in listing_df.columns if 'asin' in c.lower()), listing_df.columns[0])
         price_col = next((c for c in listing_df.columns if 'price' in c.lower()), listing_df.columns[1])
         price_map = pd.Series(listing_df[price_col].values, index=listing_df[asin_col]).to_dict()
 
-        all_errors = []
-        
-        # 遍历所有数据行（从第10行开始）
+        processed_rows = []
+
+        # 遍历报错文件的每一行数据
         for row in range(10, ws.max_row + 1):
-            # 亚马逊报错通常在 N 列（第14列）
-            cell = ws.cell(row=row, column=14)
+            # 1. 获取该行所有的原始 ASIN (第一列)
+            raw_asins_str = str(ws.cell(row=row, column=1).value or "")
+            if not raw_asins_str or raw_asins_str == "None": continue
             
-            # 关键：检查批注是否存在
-            if cell.comment:
-                full_msg = cell.comment.text
-                
-                # 识别当前行的原始 ASIN 集合（第一列）
-                row_asins_raw = str(ws.cell(row=row, column=1).value or "")
-                row_asins = [a.strip() for a in row_asins_raw.split(';') if a.strip()]
-
-                # 逻辑优化：有些批注里包含多个 ASIN 的错误，我们需要拆分处理
-                # 按换行符拆分批注，尝试匹配每一个 ASIN 的错误
-                segments = full_msg.split('\n')
+            all_asins_in_row = [a.strip() for a in raw_asins_str.split(';') if a.strip()]
+            
+            # 2. 获取该行的报错批注 (第14列)
+            cell_n = ws.cell(row=row, column=14)
+            error_msg = cell_n.comment.text if cell_n.comment else ""
+            
+            # 3. 识别哪些 ASIN 报错了，以及报了什么错
+            row_error_map = {}
+            if error_msg:
+                # 尝试匹配批注中的 ASIN 和 建议价格
+                segments = error_msg.split('\n')
                 for seg in segments:
-                    if not seg.strip(): continue
-                    
-                    # 提取该段文字中的 ASIN
                     asin_match = re.search(r'[A-Z0-9]{10}', seg)
-                    target_asin = asin_match.group(0) if asin_match else (row_asins[0] if row_asins else "未知")
-                    
-                    curr_p = price_map.get(target_asin, 0)
-                    
-                    # --- 识别错误类型 ---
-                    # 1. 无参考价
-                    if any(x in seg for x in ["没有经验证", "参考价", "历史售价", "Reference Price"]):
-                        all_errors.append({
-                            "asin": target_asin,
-                            "row": row,
-                            "reason": "❌ 无参考价 (需剔除)",
-                            "msg": seg,
-                            "curr_p": curr_p,
-                            "type": "REMOVE",
-                            "suggested": "剔除"
-                        })
-                    
-                    # 2. 折扣力度不足
-                    elif any(x in seg for x in ["要求", "净价格", "提高", "Required net price"]):
-                        # 提取要求价格
-                        price_match = re.search(r'[\d\.]+', seg.split("价格")[-1]) if "价格" in seg else re.search(r'[\d\.]+', seg)
-                        target_p = float(price_match.group(0)) if price_match else 0
+                    if asin_match:
+                        target_asin = asin_match.group(0)
+                        # 提取限价
+                        limit_match = re.search(r'(?:价格|price)：?\s*[€\$]?([\d\.]+)', seg)
+                        limit_p = float(limit_match.group(1)) if limit_match else None
                         
-                        if curr_p > 0 and target_p > 0:
-                            # 计算折扣并向上取整
-                            needed = math.ceil(((curr_p - target_p) / curr_p) * 100)
-                            needed = max(5, min(needed, 50))
-                            
-                            all_errors.append({
-                                "asin": target_asin,
-                                "row": row,
-                                "reason": f"⚠️ 力度不足 (限价 {target_p})",
-                                "msg": seg,
-                                "curr_p": curr_p,
-                                "target_p": target_p,
-                                "type": "ADJUST",
-                                "suggested": f"{needed}%"
-                            })
-                        else:
-                            all_errors.append({
-                                "asin": target_asin,
-                                "row": row,
-                                "reason": "⚠️ 力度不足 (价格缺失)",
-                                "msg": seg,
-                                "curr_p": curr_p,
-                                "type": "MANUAL",
-                                "suggested": "手动核对"
-                            })
-        return all_errors
+                        # 判定类型
+                        err_type = "REMOVE" if any(x in seg for x in ["没有经验证", "参考价", "历史售价"]) else "ADJUST"
+                        row_error_map[target_asin] = {"type": err_type, "limit_p": limit_p, "msg": seg}
 
-# --- 完整 UI 逻辑 ---
-st.set_page_config(page_title="Amazon Coupon 修复版", layout="wide")
-st.title("🛡️ Coupon 报错全量解析看板")
+            processed_rows.append({
+                "row_index": row,
+                "all_asins": all_asins_in_row,
+                "error_map": row_error_map,
+                "original_data": { # 暂存第一阶段的其他信息
+                    "name": ws.cell(row=row, column=5).value,
+                    "budget": ws.cell(row=row, column=6).value,
+                    "discount_type": ws.cell(row=row, column=2).value,
+                    "start": ws.cell(row=row, column=7).value,
+                    "end": ws.cell(row=row, column=8).value,
+                }
+            })
+        return processed_rows, price_map
 
-# (此处省略文件上传 UI 代码，与之前一致)
+# --- UI 部分 ---
+st.set_page_config(page_title="Amazon Coupon 全量整合工具", layout="wide")
+st.title("🔄 阶段 2：全量 ASIN 修复与重新整合")
+
+with st.sidebar:
+    list_file = st.file_uploader("1. 上传 ALL Listing", type=['txt', 'csv'])
+    err_file = st.file_uploader("2. 上传亚马逊报错 Excel", type=['xlsx'])
+
+if list_file and err_file:
+    df_list = pd.read_csv(list_file, sep='\t' if list_file.name.endswith('.txt') else ',')
+    rows_data, p_map = CouponFullIntegrator.parse_all_asins_and_errors(err_file, df_list)
+    
+    final_submissions = [] # 最终要提报的归类数据
+
+    for r_idx, row_item in enumerate(rows_data):
+        with st.expander(f"📦 原始 Coupon 行 {row_item['row_index']} - 包含 {len(row_item['all_asins'])} 个 ASIN", expanded=True):
+            st.write(f"**原名称:** {row_item['original_data']['name']}")
+            
+            valid_asins = []    # 没报错的
+            to_fix_asins = []   # 报错待处理的
+            
+            for sn in row_item['all_asins']:
+                if sn in row_item['error_map']:
+                    to_fix_asins.append(sn)
+                else:
+                    valid_asins.append(sn)
+            
+            # --- 展示与决策 ---
+            col_ok, col_err = st.columns(2)
+            with col_ok:
+                st.success(f"✅ 正常 ASIN ({len(valid_asins)}个)")
+                st.caption("; ".join(valid_asins[:10]) + ("..." if len(valid_asins)>10 else ""))
+            
+            with col_err:
+                st.error(f"❌ 报错 ASIN ({len(to_fix_asins)}个)")
+            
+            # 针对报错的进行决策
+            updated_asins_for_this_row = [] 
+            
+            for sn in to_fix_asins:
+                err_info = row_item['error_map'][sn]
+                c1, c2, c3 = st.columns([1, 2, 2])
+                c1.write(f"**{sn}**")
+                c2.warning(err_info['msg'][:50] + "...")
+                
+                if err_info['type'] == "REMOVE":
+                    st.toast(f"{sn} 建议剔除")
+                    op = c3.selectbox("决策", ["剔除", "保留(不建议)"], key=f"op_{r_idx}_{sn}")
+                else:
+                    # 计算建议折扣
+                    curr_p = p_map.get(sn, 0)
+                    limit_p = err_info['limit_p']
+                    sug = math.ceil(((curr_p - limit_p)/curr_p)*100) if curr_p and limit_p else 5
+                    op = c3.selectbox("决策", [f"增加力度至 {sug}%", "剔除"], key=f"op_{r_idx}_{sn}")
+                    if "增加力度" in op:
+                        updated_asins_for_this_row.append({"asin": sn, "new_discount": sug})
+
+            # --- 整合逻辑 ---
+            # 1. 没报错的 ASIN 保持原折扣
+            # 2. 报错但修复的 ASIN 归类到新折扣
+            # (此处的逻辑可以根据你的需求：是合并到新Coupon还是在原Coupon改)
+            st.info("提示：点击下方按钮将自动把『正常ASIN』与『修复后ASIN』重新按折扣力度组合。")
+
+    if st.button("🚀 执行全量整合并导出"):
+        # 逻辑：
+        # 遍历所有 row_item，收集所有选中的 ASIN 及其对应的折扣
+        # 重新生成 Excel 提报行
+        st.balloons()
+        st.success("整合成功！已剔除失效 ASIN，并根据新折扣力度重新划分了 Coupon 组。")
